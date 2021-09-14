@@ -60,6 +60,100 @@
         }
     ```
 
+    JobSystem继承自IExecuteSystem，主要用于处理多线程任务系统。https://www.cnblogs.com/sifenkesi/p/12258842.html，讲述了JobSystem是如何使用多线程工作的，有什么优势。
+
+    ```c#
+        //JobSystem调用带有实体子集的Execute(实体)，并将工作负载分配到指定数量的线程上。在Entitas中编写多线程代码时，不要使用生成的方法，如AddXyz()和ReplaceXyz()。
+        public abstract class JobSystem<TEntity> : IExecuteSystem where TEntity : class, IEntity {
+    
+            readonly IGroup<TEntity> _group;
+            readonly int _threads;
+            //job system管理job依赖关系，并保证执行时序的正确性
+            readonly Job<TEntity>[] _jobs;
+    
+            int _threadsRunning;
+    
+            protected JobSystem(IGroup<TEntity> group, int threads) {
+                _group = group;
+                _threads = threads;
+                _jobs = new Job<TEntity>[threads];
+                for (int i = 0; i < _jobs.Length; i++) {
+                    _jobs[i] = new Job<TEntity>();
+                }
+            }
+    
+            protected JobSystem(IGroup<TEntity> group) : this(group, Environment.ProcessorCount) {
+            }
+    
+            public virtual void Execute() {
+                _threadsRunning = _threads;
+                var entities = _group.GetEntities();
+                var remainder = entities.Length % _threads;
+                //计算出每个线程处理多少个对象
+                var slice = entities.Length / _threads + (remainder == 0 ? 0 : 1);
+                for (int t = 0; t < _threads; t++) {
+                    var from = t * slice;
+                    var to = from + slice;
+                    if (to > entities.Length) {
+                        to = entities.Length;
+                    }
+    
+                    var job = _jobs[t];
+                    job.Set(entities, from, to);
+                    if (from != to) {
+                        //线程池
+                        //将jobs放在一个job queue里面，worker threads从job queue里面获取job然后执行
+                        ThreadPool.QueueUserWorkItem(queueOnThread, _jobs[t]);
+                    } else {
+                        Interlocked.Decrement(ref _threadsRunning);
+                    }
+                }
+    
+                while (_threadsRunning != 0) {
+                }
+    
+                foreach (var job in _jobs) {
+                    if (job.exception != null) {
+                        throw job.exception;
+                    }
+                }
+            }
+            
+            //线程callback 调用Execute处理对象
+            void queueOnThread(object state) {
+                var job = (Job<TEntity>)state;
+                try {
+                    for (int i = job.from; i < job.to; i++) {
+                        Execute(job.entities[i]);
+                    }
+                } catch (Exception ex) {
+                    job.exception = ex;
+                } finally {
+                    Interlocked.Decrement(ref _threadsRunning);
+                }
+            }
+    
+            protected abstract void Execute(TEntity entity);
+        }
+        //完成特定任务的一个小的工作单元。job接收参数并操作数据，类似于函数调用。job之间可以有依赖关系，也就是一个job可以等另一个job完成之后再执行。
+        class Job<TEntity> where TEntity : class, IEntity {
+    
+            public TEntity[] entities;
+            public int from;
+            public int to;
+            public Exception exception;
+    
+            public void Set(TEntity[] entities, int from, int to) {
+                this.entities = entities;
+                this.from = from;
+                this.to = to;
+                exception = null;
+            }
+        }
+    ```
+
+    
+
   - IInitializeSystem,只会在ecs环境初始化时调用。
 
     ```c#
@@ -87,9 +181,9 @@
 
     - ICollector，关注某类组件，当实体身上的某类组件发生改变时会收集这些实体对象
     - Filter，对收集的实体对象列表再次过滤，条件自定义。
-    - Execute，传入的参数就是每帧通过上面两个方法收集到的实体对象列表
-    - ReactiveSystem构造函数中会初始化收集信息（context.CreateCollector()）context的拓展方法和一个用于存放实体对象的列表（ _buffer = new List<TEntity>()）
-    - 
+    - Execute(List<TEntity>entities)，传入的参数就是每帧通过上面两个方法收集到的实体对象列表
+    - ReactiveSystem构造函数中会初始化收集信息（context.CreateCollector()）context的拓展和一个用于存放实体对象的列表（ _buffer = new List<TEntity>()）
+    - Execute(),从收集器中获取目标并通过Filter方法过滤后获得最终list列表传入到有参Execute方法，并清空收集器，在list使用完毕后release entity并清空列表list
 
     ```c#
      public abstract class ReactiveSystem<TEntity> : IReactiveSystem where TEntity : class, IEntity {
@@ -176,6 +270,109 @@
         }
     ```
 
+    MultiReactiveSystem继承自IReactiveSystem,多收集器触发系统,与ReactuveSystem差不多，只不过对象一个是通过单个collector收集一个是通过多个collector收集，其他的机制都一样。
+
+    ```c#
+     public abstract class MultiReactiveSystem<TEntity, TContexts> : IReactiveSystem
+            where TEntity : class, IEntity
+            where TContexts : class, IContexts {
+    
+            readonly ICollector[] _collectors;
+            readonly HashSet<TEntity> _collectedEntities;
+            readonly List<TEntity> _buffer;
+            string _toStringCache;
+    
+            protected MultiReactiveSystem(TContexts contexts) {
+                _collectors = GetTrigger(contexts);
+                _collectedEntities = new HashSet<TEntity>();
+                _buffer = new List<TEntity>();
+            }
+    
+            protected MultiReactiveSystem(ICollector[] collectors) {
+                _collectors = collectors;
+                _collectedEntities = new HashSet<TEntity>();
+                _buffer = new List<TEntity>();
+            }
+    
+            /// Specify the collector that will trigger the ReactiveSystem.
+            protected abstract ICollector[] GetTrigger(TContexts contexts);
+    
+            /// This will exclude all entities which don't pass the filter.
+            protected abstract bool Filter(TEntity entity);
+    
+            protected abstract void Execute(List<TEntity> entities);
+    
+            /// Activates the ReactiveSystem and starts observing changes
+            /// based on the specified Collector.
+            /// ReactiveSystem are activated by default.
+            public void Activate() {
+                for (int i = 0; i < _collectors.Length; i++) {
+                    _collectors[i].Activate();
+                }
+            }
+    
+            /// Deactivates the ReactiveSystem.
+            /// No changes will be tracked while deactivated.
+            /// This will also clear the ReactiveSystem.
+            /// ReactiveSystem are activated by default.
+            public void Deactivate() {
+                for (int i = 0; i < _collectors.Length; i++) {
+                    _collectors[i].Deactivate();
+                }
+            }
+    
+            /// Clears all accumulated changes.
+            public void Clear() {
+                for (int i = 0; i < _collectors.Length; i++) {
+                    _collectors[i].ClearCollectedEntities();
+                }
+            }
+    
+            /// Will call Execute(entities) with changed entities
+            /// if there are any. Otherwise it will not call Execute(entities).
+            public void Execute() {
+                for (int i = 0; i < _collectors.Length; i++) {
+                    var collector = _collectors[i];
+                    if (collector.count != 0) {
+                        _collectedEntities.UnionWith(collector.GetCollectedEntities<TEntity>());
+                        collector.ClearCollectedEntities();
+                    }
+                }
+    
+                foreach (var e in _collectedEntities) {
+                    if (Filter(e)) {
+                        e.Retain(this);
+                        _buffer.Add(e);
+                    }
+                }
+    
+                if (_buffer.Count != 0) {
+                    try {
+                        Execute(_buffer);
+                    } finally {
+                        for (int i = 0; i < _buffer.Count; i++) {
+                            _buffer[i].Release(this);
+                        }
+                        _collectedEntities.Clear();
+                        _buffer.Clear();
+                    }
+                }
+            }
+    
+            public override string ToString() {
+                if (_toStringCache == null) {
+                    _toStringCache = "MultiReactiveSystem(" + GetType().Name + ")";
+                }
+    
+                return _toStringCache;
+            }
+    
+            ~MultiReactiveSystem() {
+                Deactivate();
+            }
+        }
+    ```
+
     
 
   - IClearUpSystem,在每帧update后调用。
@@ -202,7 +399,135 @@
         }
     ```
 
+  - System，管理各个类型的system，将子system加入到system中，system会调用Initialize，Execute，Cleanup,TearDown,ActivateReactiveSystems,DeactivateReactiveSystems,ClearReactiveSystems方法去遍历调用各个system的逻辑接口。
+
+    ```c#
+     public class Systems : IInitializeSystem, IExecuteSystem, ICleanupSystem, ITearDownSystem {
     
+            protected readonly List<IInitializeSystem> _initializeSystems;
+            protected readonly List<IExecuteSystem> _executeSystems;
+            protected readonly List<ICleanupSystem> _cleanupSystems;
+            protected readonly List<ITearDownSystem> _tearDownSystems;
+    
+            /// Creates a new Systems instance.
+            public Systems() {
+                _initializeSystems = new List<IInitializeSystem>();
+                _executeSystems = new List<IExecuteSystem>();
+                _cleanupSystems = new List<ICleanupSystem>();
+                _tearDownSystems = new List<ITearDownSystem>();
+            }
+    
+            /// Adds the system instance to the systems list.
+            public virtual Systems Add(ISystem system) {
+                var initializeSystem = system as IInitializeSystem;
+                if (initializeSystem != null) {
+                    _initializeSystems.Add(initializeSystem);
+                }
+    
+                var executeSystem = system as IExecuteSystem;
+                if (executeSystem != null) {
+                    _executeSystems.Add(executeSystem);
+                }
+    
+                var cleanupSystem = system as ICleanupSystem;
+                if (cleanupSystem != null) {
+                    _cleanupSystems.Add(cleanupSystem);
+                }
+    
+                var tearDownSystem = system as ITearDownSystem;
+                if (tearDownSystem != null) {
+                    _tearDownSystems.Add(tearDownSystem);
+                }
+    
+                return this;
+            }
+    
+            /// Calls Initialize() on all IInitializeSystem and other
+            /// nested Systems instances in the order you added them.
+            public virtual void Initialize() {
+                for (int i = 0; i < _initializeSystems.Count; i++) {
+                    _initializeSystems[i].Initialize();
+                }
+            }
+    
+            /// Calls Execute() on all IExecuteSystem and other
+            /// nested Systems instances in the order you added them.
+            public virtual void Execute() {
+                for (int i = 0; i < _executeSystems.Count; i++) {
+                    _executeSystems[i].Execute();
+                }
+            }
+    
+            /// Calls Cleanup() on all ICleanupSystem and other
+            /// nested Systems instances in the order you added them.
+            public virtual void Cleanup() {
+                for (int i = 0; i < _cleanupSystems.Count; i++) {
+                    _cleanupSystems[i].Cleanup();
+                }
+            }
+    
+            /// Calls TearDown() on all ITearDownSystem  and other
+            /// nested Systems instances in the order you added them.
+            public virtual void TearDown() {
+                for (int i = 0; i < _tearDownSystems.Count; i++) {
+                    _tearDownSystems[i].TearDown();
+                }
+            }
+    
+            /// Activates all ReactiveSystems in the systems list.
+            public void ActivateReactiveSystems() {
+                for (int i = 0; i < _executeSystems.Count; i++) {
+                    var system = _executeSystems[i];
+                    var reactiveSystem = system as IReactiveSystem;
+                    if (reactiveSystem != null) {
+                        reactiveSystem.Activate();
+                    }
+    
+                    var nestedSystems = system as Systems;
+                    if (nestedSystems != null) {
+                        nestedSystems.ActivateReactiveSystems();
+                    }
+                }
+            }
+    
+            /// Deactivates all ReactiveSystems in the systems list.
+            /// This will also clear all ReactiveSystems.
+            /// This is useful when you want to soft-restart your application and
+            /// want to reuse your existing system instances.
+            public void DeactivateReactiveSystems() {
+                for (int i = 0; i < _executeSystems.Count; i++) {
+                    var system = _executeSystems[i];
+                    var reactiveSystem = system as IReactiveSystem;
+                    if (reactiveSystem != null) {
+                        reactiveSystem.Deactivate();
+                    }
+    
+                    var nestedSystems = system as Systems;
+                    if (nestedSystems != null) {
+                        nestedSystems.DeactivateReactiveSystems();
+                    }
+                }
+            }
+    
+            /// Clears all ReactiveSystems in the systems list.
+            public void ClearReactiveSystems() {
+                for (int i = 0; i < _executeSystems.Count; i++) {
+                    var system = _executeSystems[i];
+                    var reactiveSystem = system as IReactiveSystem;
+                    if (reactiveSystem != null) {
+                        reactiveSystem.Clear();
+                    }
+    
+                    var nestedSystems = system as Systems;
+                    if (nestedSystems != null) {
+                        nestedSystems.ClearReactiveSystems();
+                    }
+                }
+            }
+        }
+    ```
+
+- ECS中的C，Component组件，组件中存放的是数据，实体通过添加组件来获取数据，系统通过操作组件来修改数据，实体本身不对数据进行操作。
 
 
 
