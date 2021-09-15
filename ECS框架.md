@@ -529,5 +529,34 @@
 
 - ECS中的C，Component组件，组件中存放的是数据，实体通过添加组件来获取数据，系统通过操作组件来修改数据，实体本身不对数据进行操作。
 
+  所有组件都继承自IComponent接口，自动生成工具会找到所有继承自这个接口的类，生成对应的组件类。
+
+  ```c#
+     public interface IComponent {
+      }
+     [Game]
+     public class IUnitIdComponent : IComponent
+     { 
+       [PrimaryEntityIndex]
+        public int uId;
+     }
+  ```
+
+  
+
+  组件可以通过属性方法去设置组件的属性，所有的属性都最终继承自c#的Attribute类,说一下常用的属性
+
+  - Unique，单例，下文中只有一个实体与该组件存在。
+
+  - [Game]or[Data]or[其他名称]这个代表该组件只在对应的context环境下才能添加
+
+  - FlagPrefix，给组件添加标记比如 FlagPrefix("Has"),在使用组件的时候就可以entity.hasXXX
+
+  - PrimaryEntityIndex,数据唯一，标记组件中的某个数据在context中只能不能有相同值。
+
+  - DontGenerate 不要自动生成对应的组件类。
+
+    
+
 
 
